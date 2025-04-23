@@ -1,15 +1,31 @@
 mod user_store;
 
-use axum::{
-    Router,
-    extract::State,
-    response::Json,
-    routing::{get, post},
-};
+use axum::{Json, Router, routing::post};
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
-use user_store::{ShareRole, UserStore};
+use user_store::{
+    ShareRole, add_user, get_user_sheets, logout_user, remove_user_access, share_sheet,
+    validate_user,
+};
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/signup", post(signup))
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .route("/share", post(share_handler))
+        .route("/remove_access", post(remove_access_handler))
+        .route("/sheets", post(list_sheets));
+
+    let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    println!(
+        "Server running on http://{}",
+        listener.local_addr().unwrap()
+    );
+
+    axum::serve(listener, app).await.unwrap();
+}
 
 #[derive(Deserialize)]
 struct Credentials {
@@ -18,101 +34,79 @@ struct Credentials {
 }
 
 #[derive(Deserialize)]
+struct LogoutRequest {
+    username: String,
+}
+
+#[derive(Deserialize)]
 struct ShareRequest {
     username: String,
     target_user: String,
-    role: String, // "collaborator" or "viewer"
+    role: String, // "collaborator" or "viewer", ignored for remove_access
 }
 
-#[tokio::main]
-async fn main() {
-    let store = Arc::new(Mutex::new(UserStore::new()));
-
-    let app = Router::new()
-        .route("/signup", post(signup))
-        .route("/login", post(login))
-        .route("/share", post(share_sheet))
-        .route("/sheets", get(view_shared_sheets))
-        .with_state(store);
-
-    let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
-    println!("Server running on http://127.0.0.1:3000");
-
-    axum::serve(listener, app).await.unwrap();
+#[derive(Deserialize)]
+struct RemoveAccessRequest {
+    username: String,    // owner
+    target_user: String, // user to remove access for
 }
 
-async fn signup(
-    State(user_store): State<Arc<Mutex<UserStore>>>,
-    Json(payload): Json<Credentials>,
-) -> Json<String> {
-    match user_store
-        .lock()
-        .unwrap()
-        .add_user(&payload.username, &payload.password)
-    {
+async fn signup(Json(payload): Json<Credentials>) -> Json<String> {
+    match add_user(&payload.username, &payload.password) {
         Ok(_) => Json(format!(
-            "User '{}' registered successfully!",
+            "User '{}' registered and logged in!",
             payload.username
         )),
-        Err(msg) => Json(format!("Signup failed: {}", msg)),
+        Err(e) => Json(format!("Signup failed: {}", e)),
     }
 }
 
-async fn login(
-    State(user_store): State<Arc<Mutex<UserStore>>>,
-    Json(payload): Json<Credentials>,
-) -> Json<String> {
-    match user_store
-        .lock()
-        .unwrap()
-        .validate_user(&payload.username, &payload.password)
-    {
+async fn login(Json(payload): Json<Credentials>) -> Json<String> {
+    match validate_user(&payload.username, &payload.password) {
         Ok(_) => Json(format!("Login successful for '{}'", payload.username)),
-        Err(msg) => Json(format!("Login failed: {}", msg)),
+        Err(e) => Json(format!("Login failed: {}", e)),
     }
 }
 
-async fn share_sheet(
-    State(user_store): State<Arc<Mutex<UserStore>>>,
-    Json(payload): Json<ShareRequest>,
-) -> Json<String> {
-    let store = user_store.lock().unwrap();
-    if !store.logged_in_users.contains(&payload.username) {
-        return Json("You must be logged in to share a sheet".to_string());
+async fn logout(Json(payload): Json<LogoutRequest>) -> Json<String> {
+    // Modified to only require username for logout
+    match logout_user(&payload.username) {
+        Ok(_) => Json(format!("User '{}' logged out", payload.username)),
+        Err(e) => Json(format!("Logout failed: {}", e)),
     }
+}
 
-    if !store.users.contains_key(&payload.target_user) {
-        return Json("Target user does not exist".to_string());
-    }
-
+async fn share_handler(Json(payload): Json<ShareRequest>) -> Json<String> {
+    // parse role
     let role = match payload.role.as_str() {
         "collaborator" => ShareRole::Collaborator,
         "viewer" => ShareRole::Viewer,
-        _ => return Json("Invalid role".to_string()),
+        _ => return Json("Invalid role, must be 'collaborator' or 'viewer'".into()),
     };
 
-    drop(store); // release read lock before write
-
-    match user_store
-        .lock()
-        .unwrap()
-        .share_sheet(&payload.username, &payload.target_user, role)
-    {
-        Ok(_) => Json(format!("Sheet shared with '{}'", payload.target_user)),
-        Err(msg) => Json(format!("Failed to share sheet: {}", msg)),
+    match share_sheet(&payload.username, &payload.target_user, role) {
+        Ok(_) => Json(format!(
+            "User '{}' shared with '{}' as {}",
+            payload.username, payload.target_user, payload.role
+        )),
+        Err(e) => Json(format!("Share failed: {}", e)),
     }
 }
 
-async fn view_shared_sheets(
-    State(user_store): State<Arc<Mutex<UserStore>>>,
-    Json(payload): Json<Credentials>,
-) -> Json<Vec<String>> {
-    match user_store
-        .lock()
-        .unwrap()
-        .get_user_sheets(&payload.username)
-    {
-        Ok(sheets) => Json(sheets),
-        Err(_) => Json(vec!["Error: Unable to fetch sheets".to_string()]),
+async fn remove_access_handler(Json(payload): Json<RemoveAccessRequest>) -> Json<String> {
+    match remove_user_access(&payload.username, &payload.target_user) {
+        Ok(_) => Json(format!(
+            "Access for '{}' removed from '{}'",
+            payload.target_user, payload.username
+        )),
+        Err(e) => Json(format!("Remove-access failed: {}", e)),
+    }
+}
+
+async fn list_sheets(Json(payload): Json<LogoutRequest>) -> Json<Vec<String>> {
+    // Modified to only require username for listing sheets
+    match get_user_sheets(&payload.username) {
+        Ok(list) => Json(list),
+        Err(e) => Json(vec![format!("Error fetching sheets: {}", e)]),
     }
 }
